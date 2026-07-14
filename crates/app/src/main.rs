@@ -1,12 +1,85 @@
 // crates/app/src/main.rs
 use iced::widget::{container, image};
 use iced::window;
-use iced::{Background, Color, ContentFit, Element, Length, Size, Subscription, Task, Theme};
+use iced::{Color, ContentFit, Element, Length, Size, Subscription, Task};
 use iced::time::{Duration, Instant};
-use pdfium::{set_library_location, PdfiumDocument, PdfiumPage, PdfiumRenderConfig};
+use pdfium::{
+    set_library_location, PdfiumDocument, PdfiumPage, PdfiumRenderConfig, PdfiumRenderFlags,
+};
+use window_vibrancy::{NSVisualEffectMaterial, NSVisualEffectState};
 
-/// Backdrop shown around the page when the window's aspect ratio doesn't match the page's.
-const BACKDROP: Color = Color::from_rgb(0x78 as f32 / 255.0, 0x78 as f32 / 255.0, 0x78 as f32 / 255.0);
+/// Applies macOS window vibrancy behind our rendered content.
+///
+/// We can't use `window_vibrancy::apply_vibrancy` directly: it inserts its blur view as a
+/// *subview* of the target view, which is fine for ordinary AppKit content, but our target view
+/// is also the one wgpu renders into (its `layer` is a `CAMetalLayer`). In AppKit, subviews
+/// always draw in front of their parent's own layer content, regardless of subview ordering --
+/// so the blur would end up covering our rendered page instead of sitting behind it. Inserting
+/// the blur into the content view's *superview* instead makes it a true sibling, where z-order
+/// (and thus our opaque page winning over the blur) is respected normally.
+#[cfg(target_os = "macos")]
+mod vibrancy {
+    use objc2_app_kit::{
+        NSAutoresizingMaskOptions, NSVisualEffectBlendingMode, NSView, NSWindowOrderingMode,
+    };
+    use objc2_foundation::{MainThreadMarker, NSInteger};
+    use raw_window_handle::RawWindowHandle;
+    use window_vibrancy::{NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectViewTagged};
+
+    /// NSView tag applied to the inserted blur view, matching `window-vibrancy`'s own convention.
+    const VIBRANCY_TAG: NSInteger = 91376254;
+
+    pub fn apply(
+        window: &dyn iced::window::Window,
+        material: NSVisualEffectMaterial,
+        state: NSVisualEffectState,
+    ) {
+        let Ok(handle) = window.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+            return;
+        };
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+
+        // Safety: `ns_view` is a live `NSView*` for the duration of this call -- we're running
+        // inside a callback dispatched by iced's runtime specifically for this open window.
+        let view: &NSView = unsafe { handle.ns_view.cast().as_ref() };
+        let Some(parent) = (unsafe { view.superview() }) else {
+            return;
+        };
+
+        let blurred_view =
+            unsafe { NSVisualEffectViewTagged::initWithFrame(mtm.alloc(), view.frame(), VIBRANCY_TAG) };
+        unsafe {
+            blurred_view.setMaterial(objc2_app_kit::NSVisualEffectMaterial(material as NSInteger));
+            blurred_view.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+            blurred_view.setState(objc2_app_kit::NSVisualEffectState(state as NSInteger));
+            blurred_view.setAutoresizingMask(
+                NSAutoresizingMaskOptions::ViewWidthSizable
+                    | NSAutoresizingMaskOptions::ViewHeightSizable,
+            );
+        }
+
+        parent.addSubview_positioned_relativeTo(
+            &blurred_view,
+            NSWindowOrderingMode::Below,
+            Some(view),
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod vibrancy {
+    pub fn apply(
+        _window: &dyn iced::window::Window,
+        _material: window_vibrancy::NSVisualEffectMaterial,
+        _state: window_vibrancy::NSVisualEffectState,
+    ) {
+    }
+}
 
 /// How long to let the window sit still after a resize before doing a full,
 /// crisp pdfium re-render at the new physical size.
@@ -26,12 +99,10 @@ fn fit_size(page_w: f32, page_h: f32, box_w: u32, box_h: u32) -> (u32, u32, f32)
 
 struct PdfViewer {
     page: PdfiumPage,
+    title: String,
     handle: image::Handle,
-    /// The window's own id, captured once it opens. This is what you'd pass to
-    /// `iced::window::run(id, |window| { ... })` to reach the raw `NSWindow` (via
-    /// `raw_window_handle::HasWindowHandle`) and apply vibrancy with the `window-vibrancy`
-    /// crate, e.g. `window_vibrancy::apply_vibrancy(window, NSVisualEffectMaterial::Sidebar, ..)`.
-    /// Left unused for now; this is groundwork for that follow-up.
+    /// The window's own id, captured once it opens, kept around for any future window-level
+    /// operations (vibrancy itself is applied once, right after `Opened`, in `update`).
     window_id: Option<window::Id>,
     scale_factor: f32,
     logical_size: Size,
@@ -49,9 +120,10 @@ impl PdfViewer {
     /// Builds the initial state from an already-opened page and the logical window size that
     /// was used to size the window itself (see `main`, which needs the page's aspect ratio
     /// before the window exists).
-    fn boot(page: PdfiumPage, initial_size: Size) -> Self {
+    fn boot(page: PdfiumPage, title: String, initial_size: Size) -> Self {
         let mut state = Self {
             page,
+            title,
             handle: image::Handle::from_rgba(1, 1, vec![0, 0, 0, 0]),
             window_id: None,
             scale_factor: 1.0,
@@ -61,6 +133,10 @@ impl PdfViewer {
         };
         state.render_full();
         state
+    }
+
+    fn title(&self) -> String {
+        self.title.clone()
     }
 
     /// Full pdfium rasterization at the window's current physical size. Expensive; only call
@@ -80,7 +156,13 @@ impl PdfViewer {
             .render(
                 &PdfiumRenderConfig::new()
                     .with_size(render_w as i32, render_h as i32)
-                    .with_scale(scale),
+                    .with_scale(scale)
+                    .with_transparent_background()
+                    // LCD-optimized subpixel text AA assumes compositing onto a known, fixed
+                    // background color, which no longer holds now that blank areas are
+                    // transparent over a blurred backdrop. Plain (grayscale) AA blends correctly
+                    // over anything.
+                    .with_flags(PdfiumRenderFlags::ANNOT),
             )
             .expect("failed to render page");
         let pixels = bitmap.as_rgba_bytes().expect("failed to read bitmap");
@@ -97,6 +179,14 @@ impl PdfViewer {
                         self.window_id = Some(id);
                         self.logical_size = size;
                         self.render_full();
+                        return window::run(id, |window| {
+                            vibrancy::apply(
+                                window,
+                                NSVisualEffectMaterial::Sidebar,
+                                NSVisualEffectState::FollowsWindowActiveState,
+                            );
+                        })
+                        .discard();
                     }
                     window::Event::Resized(size) => {
                         self.logical_size = size;
@@ -123,6 +213,10 @@ impl PdfViewer {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        // No background here: the letterboxed area outside the page, and now the page's own
+        // blank areas too (rendered with a transparent background in `render_full`), are left
+        // transparent so the NSVisualEffectView material applied in `update` shows through.
+        // Only actual text/graphics content stays opaque.
         container(
             image(self.handle.clone())
                 .width(Length::Fill)
@@ -133,10 +227,6 @@ impl PdfViewer {
         .height(Length::Fill)
         .center_x(Length::Fill)
         .center_y(Length::Fill)
-        .style(|_theme: &Theme| container::Style {
-            background: Some(Background::Color(BACKDROP)),
-            ..container::Style::default()
-        })
         .into()
     }
 
@@ -156,21 +246,43 @@ fn main() -> iced::Result {
         .to_path_buf();
     set_library_location(exe_dir.to_str().unwrap());
 
-    let doc =
-        PdfiumDocument::new_from_path("example.pdf", None).expect("failed to open example.pdf");
+    let path = std::env::args().nth(1).unwrap_or_else(|| "example.pdf".to_string());
+
+    let doc = PdfiumDocument::new_from_path(&path, None)
+        .unwrap_or_else(|err| panic!("failed to open {path}: {err}"));
     let page = doc.page(0).expect("failed to load first page");
     let initial_size = Size::new(INITIAL_WIDTH, INITIAL_WIDTH * page.height() / page.width());
+
+    let title = std::path::Path::new(&path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or(path);
 
     // `BootFn` requires `Fn() -> State`, but `PdfViewer::boot` is only ever called once, so we
     // stash the already-opened page behind a `RefCell` to move it in on that first call.
     let page_cell = std::cell::RefCell::new(Some(page));
-    let boot = move || PdfViewer::boot(page_cell.borrow_mut().take().expect("boot called once"), initial_size);
+    let boot = move || {
+        PdfViewer::boot(
+            page_cell.borrow_mut().take().expect("boot called once"),
+            title.clone(),
+            initial_size,
+        )
+    };
 
     iced::application(boot, PdfViewer::update, PdfViewer::view)
-        .title("PDF Viewer")
+        .title(PdfViewer::title)
         .subscription(PdfViewer::subscription)
+        .style(|_state, theme| {
+            use iced::theme::Base;
+
+            iced::theme::Style {
+                background_color: Color::TRANSPARENT,
+                ..theme.base()
+            }
+        })
         .window(window::Settings {
             size: initial_size,
+            transparent: true,
             ..window::Settings::default()
         })
         .run()
