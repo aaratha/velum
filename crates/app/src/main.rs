@@ -1,5 +1,5 @@
 // crates/app/src/main.rs
-use iced::widget::{container, image, row, slider, stack, text, toggler};
+use iced::widget::{column, container, image, row, slider, text, toggler};
 use iced::window;
 use iced::{Background, Color, ContentFit, Element, Length, Size, Subscription, Task};
 use iced::time::{Duration, Instant};
@@ -254,8 +254,10 @@ impl PdfViewer {
         // The container's own background sits behind the image, so it shows through both the
         // letterboxed area *and* the page's own blank areas (rendered transparent in
         // `render_full`). At opacity 0 it's fully see-through to the vibrancy blur; raising the
-        // slider fades in a solid white backdrop. Actual text/graphics content stays opaque
-        // either way, since the page bitmap is drawn on top of this background.
+        // slider fades in a solid backdrop -- black when the text is white and vice versa, so
+        // content stays legible. Actual text/graphics content stays opaque either way, since the
+        // page bitmap is drawn on top of this background.
+        let backdrop_color = if self.text_white { Color::BLACK } else { Color::WHITE };
         let page = container(
             image(self.handle.clone())
                 .width(Length::Fill)
@@ -268,38 +270,31 @@ impl PdfViewer {
         .center_y(Length::Fill)
         .style(move |_theme| container::Style {
             background: Some(Background::Color(
-                Color::WHITE.scale_alpha(self.background_opacity),
+                backdrop_color.scale_alpha(self.background_opacity),
             )),
             ..container::Style::default()
         });
 
-        let controls = container(
-            row![
+        let sidebar = container(
+            column![
                 text("Background opacity"),
                 slider(
                     0.0..=1.0,
                     self.background_opacity,
                     Message::BackgroundOpacityChanged
                 )
-                .step(0.01)
-                .width(200),
+                .step(0.01),
                 toggler(self.text_white)
                     .label("White text")
                     .on_toggle(Message::TextColorToggled),
             ]
-            .spacing(10)
-            .align_y(iced::Alignment::Center),
+            .spacing(16),
         )
-        .padding(10);
+        .width(Length::Fixed(180.0))
+        .height(Length::Fill)
+        .padding(16);
 
-        stack![
-            page,
-            container(controls)
-                .width(Length::Fill)
-                .align_bottom(Length::Fill)
-                .center_x(Length::Fill)
-        ]
-        .into()
+        row![sidebar, page].into()
     }
 
     fn subscription(&self) -> Subscription<Message> {
