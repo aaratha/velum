@@ -1,7 +1,7 @@
 // crates/app/src/main.rs
-use iced::widget::{container, image};
+use iced::widget::{container, image, row, slider, stack, text, toggler};
 use iced::window;
-use iced::{Color, ContentFit, Element, Length, Size, Subscription, Task};
+use iced::{Background, Color, ContentFit, Element, Length, Size, Subscription, Task};
 use iced::time::{Duration, Instant};
 use pdfium::{
     set_library_location, PdfiumDocument, PdfiumPage, PdfiumRenderConfig, PdfiumRenderFlags,
@@ -108,12 +108,19 @@ struct PdfViewer {
     logical_size: Size,
     last_rendered_physical: (u32, u32),
     pending_resize_at: Option<Instant>,
+    /// How opaque the white backdrop drawn behind the page (and the letterboxed area around it)
+    /// is, from `0.0` (fully see-through to the vibrancy blur) to `1.0` (solid white).
+    background_opacity: f32,
+    /// Whether page content (text/graphics) is recolored to white instead of its default black.
+    text_white: bool,
 }
 
 #[derive(Debug, Clone)]
 enum Message {
     WindowEvent(window::Id, window::Event),
     Tick(Instant),
+    BackgroundOpacityChanged(f32),
+    TextColorToggled(bool),
 }
 
 impl PdfViewer {
@@ -130,6 +137,8 @@ impl PdfViewer {
             logical_size: initial_size,
             last_rendered_physical: (0, 0),
             pending_resize_at: None,
+            background_opacity: 0.0,
+            text_white: false,
         };
         state.render_full();
         state
@@ -140,7 +149,9 @@ impl PdfViewer {
     }
 
     /// Full pdfium rasterization at the window's current physical size. Expensive; only call
-    /// once a resize has settled (or on startup/rescale).
+    /// once a resize has settled (or on startup/rescale). Skipped if the physical size hasn't
+    /// actually changed since the last render -- use `rasterize` directly to force a fresh one
+    /// (e.g. when only the text color changed).
     fn render_full(&mut self) {
         let target_w = (self.logical_size.width * self.scale_factor).round().max(1.0) as u32;
         let target_h = (self.logical_size.height * self.scale_factor).round().max(1.0) as u32;
@@ -148,8 +159,13 @@ impl PdfViewer {
             return;
         }
 
-        let (render_w, render_h, scale) =
-            fit_size(self.page.width(), self.page.height(), target_w, target_h);
+        self.rasterize(target_w, target_h);
+    }
+
+    /// Rasterizes the page to fit inside a `width` x `height` box, recoloring page content to
+    /// white or black per `text_white`, and always updates `handle`/`last_rendered_physical`.
+    fn rasterize(&mut self, width: u32, height: u32) {
+        let (render_w, render_h, scale) = fit_size(self.page.width(), self.page.height(), width, height);
 
         let bitmap = self
             .page
@@ -165,10 +181,22 @@ impl PdfViewer {
                     .with_flags(PdfiumRenderFlags::ANNOT),
             )
             .expect("failed to render page");
-        let pixels = bitmap.as_rgba_bytes().expect("failed to read bitmap");
+        let mut pixels = bitmap.as_rgba_bytes().expect("failed to read bitmap");
+
+        // Recolor content pixels (anything pdfium actually painted, i.e. non-transparent) to a
+        // flat white or black, keeping their original alpha so anti-aliased edges still blend
+        // correctly.
+        let ink = if self.text_white { 255 } else { 0 };
+        for pixel in pixels.chunks_exact_mut(4) {
+            if pixel[3] > 0 {
+                pixel[0] = ink;
+                pixel[1] = ink;
+                pixel[2] = ink;
+            }
+        }
 
         self.handle = image::Handle::from_rgba(render_w, render_h, pixels);
-        self.last_rendered_physical = (target_w, target_h);
+        self.last_rendered_physical = (width, height);
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -182,7 +210,7 @@ impl PdfViewer {
                         return window::run(id, |window| {
                             vibrancy::apply(
                                 window,
-                                NSVisualEffectMaterial::Sidebar,
+                                NSVisualEffectMaterial::HudWindow,
                                 NSVisualEffectState::FollowsWindowActiveState,
                             );
                         })
@@ -209,15 +237,26 @@ impl PdfViewer {
                 }
                 Task::none()
             }
+            Message::BackgroundOpacityChanged(opacity) => {
+                self.background_opacity = opacity;
+                Task::none()
+            }
+            Message::TextColorToggled(white) => {
+                self.text_white = white;
+                let (width, height) = self.last_rendered_physical;
+                self.rasterize(width, height);
+                Task::none()
+            }
         }
     }
 
     fn view(&self) -> Element<'_, Message> {
-        // No background here: the letterboxed area outside the page, and now the page's own
-        // blank areas too (rendered with a transparent background in `render_full`), are left
-        // transparent so the NSVisualEffectView material applied in `update` shows through.
-        // Only actual text/graphics content stays opaque.
-        container(
+        // The container's own background sits behind the image, so it shows through both the
+        // letterboxed area *and* the page's own blank areas (rendered transparent in
+        // `render_full`). At opacity 0 it's fully see-through to the vibrancy blur; raising the
+        // slider fades in a solid white backdrop. Actual text/graphics content stays opaque
+        // either way, since the page bitmap is drawn on top of this background.
+        let page = container(
             image(self.handle.clone())
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -227,6 +266,39 @@ impl PdfViewer {
         .height(Length::Fill)
         .center_x(Length::Fill)
         .center_y(Length::Fill)
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(
+                Color::WHITE.scale_alpha(self.background_opacity),
+            )),
+            ..container::Style::default()
+        });
+
+        let controls = container(
+            row![
+                text("Background opacity"),
+                slider(
+                    0.0..=1.0,
+                    self.background_opacity,
+                    Message::BackgroundOpacityChanged
+                )
+                .step(0.01)
+                .width(200),
+                toggler(self.text_white)
+                    .label("White text")
+                    .on_toggle(Message::TextColorToggled),
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding(10);
+
+        stack![
+            page,
+            container(controls)
+                .width(Length::Fill)
+                .align_bottom(Length::Fill)
+                .center_x(Length::Fill)
+        ]
         .into()
     }
 
