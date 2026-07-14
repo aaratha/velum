@@ -5,6 +5,4 @@ edition = "2024"
 
 [dependencies]
 pdfium = "0.10.4"
-image = { version = "0.25", default-features = false, features = ["png"] }
-winit = "0.30.13"
-softbuffer = "0.4.8"
+iced = { version = "0.14.0", features = ["image", "tokio"] }
