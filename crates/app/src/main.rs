@@ -108,9 +108,11 @@ struct PdfViewer {
     logical_size: Size,
     last_rendered_physical: (u32, u32),
     pending_resize_at: Option<Instant>,
-    /// How opaque the white backdrop drawn behind the page (and the letterboxed area around it)
-    /// is, from `0.0` (fully see-through to the vibrancy blur) to `1.0` (solid white).
+    /// How opaque the backdrop drawn behind the page (and the letterboxed area around it) is,
+    /// from `0.0` (fully see-through to the vibrancy blur) to `1.0` (solid color).
     background_opacity: f32,
+    /// Same as `background_opacity`, but for the sidebar's own backdrop.
+    sidebar_opacity: f32,
     /// Whether page content (text/graphics) is recolored to white instead of its default black.
     text_white: bool,
 }
@@ -120,6 +122,7 @@ enum Message {
     WindowEvent(window::Id, window::Event),
     Tick(Instant),
     BackgroundOpacityChanged(f32),
+    SidebarOpacityChanged(f32),
     TextColorToggled(bool),
 }
 
@@ -138,6 +141,7 @@ impl PdfViewer {
             last_rendered_physical: (0, 0),
             pending_resize_at: None,
             background_opacity: 0.0,
+            sidebar_opacity: 0.0,
             text_white: false,
         };
         state.render_full();
@@ -241,6 +245,10 @@ impl PdfViewer {
                 self.background_opacity = opacity;
                 Task::none()
             }
+            Message::SidebarOpacityChanged(opacity) => {
+                self.sidebar_opacity = opacity;
+                Task::none()
+            }
             Message::TextColorToggled(white) => {
                 self.text_white = white;
                 let (width, height) = self.last_rendered_physical;
@@ -284,6 +292,13 @@ impl PdfViewer {
                     Message::BackgroundOpacityChanged
                 )
                 .step(0.01),
+                text("Sidebar opacity"),
+                slider(
+                    0.0..=1.0,
+                    self.sidebar_opacity,
+                    Message::SidebarOpacityChanged
+                )
+                .step(0.01),
                 toggler(self.text_white)
                     .label("White text")
                     .on_toggle(Message::TextColorToggled),
@@ -292,7 +307,13 @@ impl PdfViewer {
         )
         .width(Length::Fixed(180.0))
         .height(Length::Fill)
-        .padding(16);
+        .padding(16)
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(
+                backdrop_color.scale_alpha(self.sidebar_opacity),
+            )),
+            ..container::Style::default()
+        });
 
         row![sidebar, page].into()
     }
