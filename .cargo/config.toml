@@ -1,0 +1,7 @@
+# .cargo/config.toml
+[alias]
+xtask = "run --package xtask --"
+
+[env]
+CC = { value = "clang", force = true }
+CXX = { value = "clang++", force = true }
