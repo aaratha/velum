@@ -1,0 +1,10 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pdfium = "0.10.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+winit = "0.30.13"
+softbuffer = "0.4.8"

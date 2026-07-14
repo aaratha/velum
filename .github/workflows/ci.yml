@@ -1,0 +1,20 @@
+# .github/workflows/ci.yml
+name: CI
+on: [push, pull_request]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [macos-14, macos-13, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: .pdfium-cache
+          key: pdfium-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pdfium.toml') }}
+      - run: cargo xtask fetch-pdfium
+      - run: cargo build --workspace --verbose
+      - run: cargo test --workspace
