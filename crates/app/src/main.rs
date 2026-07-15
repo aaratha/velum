@@ -1,9 +1,11 @@
 // crates/app/src/main.rs
 use iced::time::{Duration, Instant};
-use iced::widget::{column, container, image, row, slider, text, Space};
+use iced::widget::{Space, Stack, column, container, image, mouse_area, row, slider, text};
 use iced_color_picker::{Spectrum, color_picker};
 use iced::window;
-use iced::{Background, Color, ContentFit, Element, Length, Size, Subscription, Task};
+use iced::{
+    Background, Color, ContentFit, Element, Length, Padding, Size, Subscription, Task, mouse,
+};
 use pdfium::{
     PdfiumDocument, PdfiumPage, PdfiumRenderConfig, PdfiumRenderFlags, set_library_location,
 };
@@ -132,6 +134,27 @@ const INITIAL_WIDTH: f32 = 900.0;
 /// native vibrancy region geometry (`PdfViewer::vibrancy_regions`) so they can't drift apart.
 const SIDEBAR_WIDTH: f32 = 282.0;
 
+/// Sidebar row metrics, in logical points. `view` gives every label/slider/swatch an *explicit*
+/// height using these constants (rather than whatever their default sizing happens to be), so
+/// that a color popup's vertical position can be computed exactly to line up with the swatch
+/// that opened it, instead of guessed. Keep these in sync with the rows built in `view`.
+const SIDEBAR_PADDING: f32 = 16.0;
+const ROW_SPACING: f32 = 16.0;
+const LABEL_HEIGHT: f32 = 18.0;
+const SLIDER_HEIGHT: f32 = 18.0;
+const SWATCH_ROW_HEIGHT: f32 = 20.0;
+
+/// Vertical offset (from the sidebar's top) of the "Text color" swatch's row.
+const TEXT_SWATCH_TOP: f32 =
+    SIDEBAR_PADDING + 2.0 * (LABEL_HEIGHT + ROW_SPACING + SLIDER_HEIGHT + ROW_SPACING);
+
+/// Vertical offset (from the sidebar's top) of the "Backdrop color" swatch's row.
+const BACKDROP_SWATCH_TOP: f32 = TEXT_SWATCH_TOP + SWATCH_ROW_HEIGHT + ROW_SPACING;
+
+/// How far left of the sidebar's right edge a color popup's card starts, so it visibly overlaps
+/// the sidebar (per its swatch) instead of floating disconnected from it in the page area.
+const POPUP_SIDEBAR_OVERLAP: f32 = 24.0;
+
 /// Computes the largest `page_w` x `page_h` box (rounded to pixels) that fits inside
 /// `box_w` x `box_h` while preserving aspect ratio, along with the scale factor used.
 fn fit_size(page_w: f32, page_h: f32, box_w: u32, box_h: u32) -> (u32, u32, f32) {
@@ -141,31 +164,75 @@ fn fit_size(page_w: f32, page_h: f32, box_w: u32, box_h: u32) -> (u32, u32, f32)
     (w, h, scale)
 }
 
-/// A labeled color picker: a swatch previewing the current color, a saturation/value square, and
-/// a hue strip, all driving the same `on_change` message. `on_change` is called once per widget
-/// it's wired into, so it needs to be cheaply reusable -- bare message-variant constructors (e.g.
-/// `Message::TextColorChanged`) satisfy this for free, being zero-sized `Copy` function items.
-fn color_picker_field<'a>(
-    label: &'a str,
+/// Which color the currently-open picker popup (if any) is editing. Drives both which swatch
+/// toggled it open and which field `view` reads the color/message-constructor pair from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColorField {
+    Text,
+    Backdrop,
+}
+
+/// A clickable label + color swatch. Pressing it sends `TogglePicker(field)`, which `update`
+/// treats as an open/close toggle (see its match arm), so clicking an already-open swatch closes
+/// its popup.
+fn color_swatch(label: &str, color: Color, field: ColorField) -> Element<'_, Message> {
+    mouse_area(
+        row![
+            text(label).height(SWATCH_ROW_HEIGHT),
+            container(Space::new())
+                .style(move |_theme| container::Style {
+                    background: Some(color.into()),
+                    ..container::Style::default()
+                })
+                .width(28)
+                .height(18),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center)
+        .height(SWATCH_ROW_HEIGHT),
+    )
+    .interaction(mouse::Interaction::Pointer)
+    .on_press(Message::TogglePicker(field))
+    .into()
+}
+
+/// The floating popup for a swatch: a saturation/value square and a hue strip, both driving the
+/// same `on_change` message. `on_change` is called once per widget it's wired into, so it needs
+/// to be cheaply reusable -- bare message-variant constructors (e.g. `Message::TextColorChanged`)
+/// satisfy this for free, being zero-sized `Copy` function items.
+///
+/// Wrapped in its own `mouse_area` (reporting a constant, non-`None` interaction over its whole
+/// card, not just over the pickers themselves) so that the window-covering "click off to close"
+/// catcher in `view` yields to it -- iced's `Stack` skips lower layers under the cursor wherever
+/// a higher layer already reports mouse interaction there, which is what actually suppresses the
+/// close click; `on_press` isn't needed for that.
+fn color_picker_popup<'a>(
     color: Color,
     on_change: impl Fn(Color) -> Message + Copy + 'a,
 ) -> Element<'a, Message> {
-    column![
-        text(label),
-        container(Space::new().width(Length::Shrink))
-            .style(move |_theme| container::Style {
-                background: Some(color.into()),
-                ..container::Style::default()
-            })
-            .width(250)
-            .height(32),
-        color_picker(color, on_change).width(250).height(250),
-        color_picker(color, on_change)
-            .spectrum(Spectrum::HueHorizontal)
-            .width(250)
-            .height(32),
-    ]
-    .spacing(8)
+    mouse_area(
+        container(
+            column![
+                color_picker(color, on_change).width(220).height(160),
+                color_picker(color, on_change)
+                    .spectrum(Spectrum::HueHorizontal)
+                    .width(220)
+                    .height(24),
+            ]
+            .spacing(8),
+        )
+        .padding(12)
+        .style(|_theme| container::Style {
+            background: Some(Color::from_rgb8(38, 38, 38).into()),
+            border: iced::Border {
+                color: Color::from_rgba(1.0, 1.0, 1.0, 0.08),
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..container::Style::default()
+        }),
+    )
+    .interaction(mouse::Interaction::Idle)
     .into()
 }
 
@@ -188,6 +255,8 @@ struct PdfViewer {
     /// Whether page content (text/graphics) is recolored to white instead of its default black.
     text_color: Color,
     backdrop_color: Color,
+    /// Which color swatch's picker popup is currently showing, if any.
+    open_picker: Option<ColorField>,
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +267,8 @@ enum Message {
     SidebarOpacityChanged(f32),
     TextColorChanged(Color),
     BackdropColorChanged(Color),
+    TogglePicker(ColorField),
+    ClosePicker,
 }
 
 impl PdfViewer {
@@ -218,6 +289,7 @@ impl PdfViewer {
             sidebar_opacity: 0.0,
             text_color: Color::BLACK,
             backdrop_color: Color::WHITE,
+            open_picker: None,
         };
         state.render_full();
         state
@@ -370,6 +442,18 @@ impl PdfViewer {
                 self.backdrop_color = color;
                 Task::none()
             }
+            Message::TogglePicker(field) => {
+                self.open_picker = if self.open_picker == Some(field) {
+                    None
+                } else {
+                    Some(field)
+                };
+                Task::none()
+            }
+            Message::ClosePicker => {
+                self.open_picker = None;
+                Task::none()
+            }
         }
     }
 
@@ -398,38 +482,36 @@ impl PdfViewer {
         });
 
         let color_customizer = column![
-            color_picker_field("Text color", self.text_color, Message::TextColorChanged),
-            color_picker_field(
-                "Backdrop color",
-                self.backdrop_color,
-                Message::BackdropColorChanged
-            ),
+            color_swatch("Text color", self.text_color, ColorField::Text),
+            color_swatch("Backdrop color", self.backdrop_color, ColorField::Backdrop),
         ]
         .spacing(16);
 
         let sidebar = container(
             column![
-                text("Background opacity"),
+                text("Background opacity").height(LABEL_HEIGHT),
                 slider(
                     0.0..=1.0,
                     self.background_opacity,
                     Message::BackgroundOpacityChanged
                 )
-                .step(0.01),
-                text("Sidebar opacity"),
+                .step(0.01)
+                .height(SLIDER_HEIGHT),
+                text("Sidebar opacity").height(LABEL_HEIGHT),
                 slider(
                     0.0..=1.0,
                     self.sidebar_opacity,
                     Message::SidebarOpacityChanged
                 )
-                .step(0.01),
+                .step(0.01)
+                .height(SLIDER_HEIGHT),
                 color_customizer,
             ]
-            .spacing(16),
+            .spacing(ROW_SPACING),
         )
         .width(Length::Fixed(SIDEBAR_WIDTH))
         .height(Length::Fill)
-        .padding(16)
+        .padding(SIDEBAR_PADDING)
         .style(move |_theme| container::Style {
             background: Some(Background::Color(
                 self.backdrop_color.scale_alpha(self.sidebar_opacity),
@@ -437,7 +519,37 @@ impl PdfViewer {
             ..container::Style::default()
         });
 
-        row![sidebar, page].into()
+        let content: Element<'_, Message> = row![sidebar, page].into();
+
+        let Some(field) = self.open_picker else {
+            return content;
+        };
+
+        let (color, on_change, top_offset): (Color, fn(Color) -> Message, f32) = match field {
+            ColorField::Text => (self.text_color, Message::TextColorChanged, TEXT_SWATCH_TOP),
+            ColorField::Backdrop => (
+                self.backdrop_color,
+                Message::BackdropColorChanged,
+                BACKDROP_SWATCH_TOP,
+            ),
+        };
+
+        // Clicking anywhere outside the popup closes it -- including elsewhere in the sidebar,
+        // not just the page. This sits *below* both the sidebar/page content and the popup in
+        // the stack, so it only ever fires where neither of those already reports mouse
+        // interaction: `Stack` skips lower layers under the cursor wherever a higher layer does,
+        // which is what lets normal sidebar clicks (the swatch that opened this popup, other
+        // swatches, sliders) and clicks on the popup itself all take priority over closing.
+        let closer = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+            .on_press(Message::ClosePicker);
+
+        let popup = container(color_picker_popup(color, on_change)).padding(
+            Padding::ZERO
+                .left(SIDEBAR_WIDTH - POPUP_SIDEBAR_OVERLAP)
+                .top(top_offset),
+        );
+
+        Stack::new().push(closer).push(content).push(popup).into()
     }
 
     fn subscription(&self) -> Subscription<Message> {
